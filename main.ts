@@ -10,6 +10,11 @@
 // One exception: if the tape already opened mid-fall — the latest close more
 // than 1.5% under the very first close seen — hold off until the trailing
 // 60-bar return stops being negative, so we do not catch a falling knife.
+// A second exception guards the entry itself: the buy is only counted as
+// spent once its fill is confirmed. If the harness refuses it (a gap open,
+// no bar at the fill minute), the one-shot flag is cleared and the next bar
+// re-decides the entry, instead of the bot sitting on cash for the whole
+// window believing it already bought.
 //
 // Exits (either one sells the whole position and ends all trading):
 //   (a) the position is worth 93% or less of what it cost, at a close;
@@ -22,7 +27,7 @@
 // bars answer byte for byte the same. No clock, no network, no randomness,
 // no files outside this repository.
 
-import { runBars, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
+import { runBars, type Batch, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
 
@@ -46,13 +51,21 @@ const SLIDE_DEN = 100;
 // tight slippage bound.
 const WIDE_SLIPPAGE_BPS = 10_000;
 
+// The entry order's client id, so a later batch can pick its fill report
+// out of the batch and tell a fill from a refusal.
+const ENTRY_ORDER_ID = 'entry1';
+
 // Closes seen so far, oldest first, in raw price units.
 const closes: bigint[] = [];
 let bought = false;
 let finished = false;
+// True from the batch the entry order is sent until the batch that reports
+// its fill: while it is true the bot does not know yet whether it owns any
+// CBBTC.
+let entryPending = false;
 
 await runBars({
-  onBatch(state) {
+  onBatch(state, batch) {
     // Warm-up batches cannot trade; any order decided on one is rejected.
     if (state.warmingUp || finished) return [];
 
@@ -60,6 +73,18 @@ await runBars({
     if (close === null) return [];
     closes.push(close);
     const n = closes.length;
+
+    // The entry order's verdict arrives one batch after it was sent. A
+    // refusal means the cash is still there and the one-shot entry is still
+    // unspent, so clear the flag and let the entry logic below re-decide on
+    // this very bar instead of stranding the bot in cash for the window.
+    if (entryPending) {
+      for (const fill of batch.fills) {
+        if (fill.client_id !== ENTRY_ORDER_ID) continue;
+        entryPending = false;
+        if (fill.status === 'rejected') bought = false;
+      }
+    }
 
     const held = state.positions.get(SYMBOL);
     if (held !== undefined && held.qty > 0n) {
@@ -93,6 +118,7 @@ await runBars({
     }
 
     bought = true;
-    return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: WIDE_SLIPPAGE_BPS } satisfies BuyInput];
+    entryPending = true;
+    return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: WIDE_SLIPPAGE_BPS, client_id: ENTRY_ORDER_ID } satisfies BuyInput];
   },
 });
